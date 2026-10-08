@@ -14,7 +14,6 @@ const RTC_CONFIG = {
 let pc = null;
 let localStream = null;
 let currentCallId = null;
-let remoteDescSet = false;
 const unsubs = [];
 
 export const CallEvents = new EventTarget();
@@ -27,7 +26,6 @@ export async function startCall(otherUid, video) {
   pc = new RTCPeerConnection(RTC_CONFIG);
   localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
 
-  // candidates locais -> db
   pc.onicecandidate = e => {
     if (e.candidate) push(ref(db, `calls/${callId}/callerCandidates`), e.candidate.toJSON());
   };
@@ -53,12 +51,10 @@ export async function startCall(otherUid, video) {
     createdAt: Date.now(),
   });
 
-  // candidates do callee
   unsubs.push(onChildAdded(ref(db, `calls/${callId}/calleeCandidates`), snap => {
     pc?.addIceCandidate(new RTCIceCandidate(snap.val()));
   }));
 
-  // status
   unsubs.push(onValue(ref(db, `calls/${callId}/status`), snap => {
     const s = snap.val();
     CallEvents.dispatchEvent(new CustomEvent("status", { detail: s }));
@@ -141,7 +137,6 @@ export function toggleCam(on) {
   localStream?.getVideoTracks().forEach(t => t.enabled = on);
 }
 
-// Escuta chamadas recebidas
 export function listenIncomingCalls(uid, onIncoming) {
   const q = ref(db, "calls");
   return onValue(q, (snap) => {
