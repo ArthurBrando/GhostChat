@@ -42,7 +42,6 @@ export async function addMemberToChat(chatId, uid) {
 }
 
 export async function banMember(chatId, uid) {
-  // remove e marca como banido
   const updates = {};
   updates[`chats/${chatId}/members/${uid}`] = null;
   updates[`chats/${chatId}/banned/${uid}`] = true;
