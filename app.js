@@ -158,6 +158,8 @@ async function bootApp() {
   wireConvHeader();
 
   subscribeContacts();
+  subscribeContactRequests();
+  subscribeBlocks();
   subscribeChats();
   subscribeCommunities(state.user.uid, () => renderList());
   listenIncomingCalls(state.user.uid, showIncomingToast);
@@ -198,12 +200,62 @@ function subscribeContacts() {
 }
 
 async function addContactByGhostId(ghostId, alias) {
+  await requestContactByGhostId(ghostId, alias);
+}
+
+/* ============ REQUESTS / PRIVACY ============ */
+function subscribeContactRequests() {
+  const uid = state.user.uid;
+  onValue(ref(db, `requests/${uid}`), async snap => {
+    const raw = snap.val() || {};
+    const requests = {};
+    for (const [fromUid, request] of Object.entries(raw)) {
+      if (request?.status !== "pending") continue;
+      const p = await get(ref(db, `users/${fromUid}`));
+      if (p.exists()) requests[fromUid] = { ...request, profile: p.val() };
+    }
+    state.contactRequests = requests;
+    const badge = $("#request-badge");
+    if (badge) { badge.hidden = !Object.keys(requests).length; badge.textContent = Object.keys(requests).length; }
+    renderList();
+  });
+}
+function subscribeBlocks() {
+  onValue(ref(db, `blocks/${state.user.uid}`), snap => { state.blocks = snap.val() || {}; });
+}
+async function requestContactByGhostId(ghostId, alias = "") {
   const idSnap = await get(ref(db, `ghostIds/${ghostId}`));
   if (!idSnap.exists()) throw new Error("ID não encontrado.");
-  const cid = idSnap.val();
-  if (cid === state.user.uid) throw new Error("Esse é você!");
-  await set(ref(db, `contacts/${state.user.uid}/${cid}`), { alias: alias || "", addedAt: Date.now() });
-  return cid;
+  const targetUid = idSnap.val();
+  if (targetUid === state.user.uid) throw new Error("Esse é você.");
+  if (state.blocks[targetUid]) throw new Error("Você bloqueou este usuário.");
+  await set(ref(db, `requests/${targetUid}/${state.user.uid}`), { from: state.user.uid, to: targetUid, alias, status: "pending", createdAt: Date.now() });
+  toast("Solicitação enviada", "success");
+}
+async function acceptRequest(fromUid) {
+  const updates = {};
+  updates[`contacts/${state.user.uid}/${fromUid}`] = { alias: state.contactRequests[fromUid]?.alias || "", addedAt: Date.now() };
+  updates[`contacts/${fromUid}/${state.user.uid}`] = { alias: "", addedAt: Date.now() };
+  updates[`requests/${state.user.uid}/${fromUid}/status`] = "accepted";
+  await update(ref(db), updates);
+  toast("Contato adicionado", "success");
+}
+async function declineRequest(fromUid) { await remove(ref(db, `requests/${state.user.uid}/${fromUid}`)); toast("Solicitação recusada"); }
+async function blockUser(uid) { await set(ref(db, `blocks/${state.user.uid}/${uid}`), true); toast("Usuário bloqueado"); }
+async function unblockUser(uid) { await remove(ref(db, `blocks/${state.user.uid}/${uid}`)); toast("Usuário desbloqueado"); }
+async function deleteConversation(cid) {
+  await remove(ref(db, `messages/${cid}`));
+  await remove(ref(db, `chats/${cid}`));
+  state.activeChat = null; $("#conv").hidden = true; $("#empty").style.display = "flex"; document.body.classList.remove("has-conv"); toast("Conversa apagada"); renderList();
+}
+function confirmModal(title, message, onConfirm) {
+  const bg = modal({ title, bodyHtml: `<p class="dim confirm-copy">${message}</p>`, okText: "Confirmar", cancelText: "Cancelar", onOk: async () => { await onConfirm(); } });
+  return bg;
+}
+function toast(message, tone = "default") {
+  const root = $("#toast-root"); if (!root) return;
+  const el = document.createElement("div"); el.className = `toast toast-${tone}`; el.innerHTML = `<span>${message}</span><button type="button" aria-label="Fechar"><svg><use href="#i-x"/></svg></button>`;
+  el.querySelector("button").onclick = () => el.remove(); root.appendChild(el); setTimeout(() => el.remove(), 3600);
 }
 
 /* ============ CHATS ============ */
@@ -289,6 +341,17 @@ function renderList() {
   const term = ($("#chat-search")?.value || "").trim().toLowerCase();
   const tab = state.currentTab || "chats";
 
+  if (tab === "requests") {
+    const entries = Object.entries(state.contactRequests);
+    if (!entries.length) return el.innerHTML = emptyMsg("Nenhuma solicitação nova");
+    for (const [uid, req] of entries) {
+      const card = document.createElement("div"); card.className = "request-card";
+      const p = req.profile; card.innerHTML = `<img class="avatar" src="${p.avatar || avatarFallback(p.nickname || p.username)}"><div class="info"><strong>${p.nickname || p.username}</strong><small>${p.ghostId}</small></div><div class="request-actions"><button class="icon accept-request" title="Aceitar"><svg><use href="#i-check"/></svg></button><button class="icon decline-request" title="Recusar"><svg><use href="#i-x"/></svg></button></div>`;
+      card.querySelector("img").onclick = () => openUserProfile(uid); card.querySelector(".accept-request").onclick = () => acceptRequest(uid); card.querySelector(".decline-request").onclick = () => declineRequest(uid); el.appendChild(card);
+    }
+    return;
+  }
+
   if (tab === "contacts") {
     const entries = Object.entries(state.contacts);
     if (!entries.length) return el.innerHTML = emptyMsg("Nenhum contato. Toque em +.");
@@ -298,6 +361,7 @@ function renderList() {
         title: alias || profile.nickname || profile.username,
         sub: profile.ghostId,
         onclick: () => openDirectChat(uid),
+        onAvatar: () => openUserProfile(uid),
       }));
     }
     return;
@@ -336,13 +400,14 @@ function renderList() {
   }
 }
 function emptyMsg(t) { return `<p style="padding:24px;text-align:center;color:var(--text-dim);font-size:13px">${t}</p>`; }
-function itemEl({ img, title, sub, onclick, active }) {
+function itemEl({ img, title, sub, onclick, active, onAvatar }) {
   const d = document.createElement("div");
   d.className = "item" + (active ? " active" : "");
-  d.innerHTML = `<img class="avatar" src="${img}"><div class="info"><strong></strong><small></small></div>`;
+  d.innerHTML = `<button class="avatar-button item-avatar" type="button"><img class="avatar" src="${img}"></button><div class="info"><strong></strong><small></small></div>`;
   d.querySelector("strong").textContent = title;
   d.querySelector("small").textContent = sub;
   d.onclick = onclick;
+  if (onAvatar) { d.querySelector(".item-avatar").onclick = e => { e.stopPropagation(); onAvatar(); }; }
   return d;
 }
 function directTitle(chat) {
@@ -353,6 +418,7 @@ function directTitle(chat) {
 
 /* ============ OPEN CHAT ============ */
 async function openDirectChat(otherUid) {
+  if (state.blocks[otherUid]) return openUserProfile(otherUid);
   const cid = await ensureDirectChat(otherUid);
   openChat(cid);
 }
@@ -370,6 +436,7 @@ async function openChat(cid) {
 
   const title = chat.type === "direct" ? directTitle(chat) : chat.name;
   $("#conv-name").textContent = title;
+  $("#btn-conv-profile").onclick = () => { const other = Object.keys(chat.members || {}).find(u => u !== state.user.uid); if (other) openUserProfile(other); };
   $("#conv-avatar").src = chat.avatar || avatarFallback(title);
   $("#conv-sub").textContent =
     chat.type === "direct" ? "Criptografia de ponta a ponta" :
@@ -416,7 +483,7 @@ async function openCommunity(cid) {
       const code = await createInvite(tmpId);
       const link = `${location.origin}${location.pathname}?invite=${code}`;
       await navigator.clipboard.writeText(link).catch(()=>{});
-      alert("Convite da comunidade copiado:\n" + link);
+      toast("Convite copiado", "success");
     }
   });
 
@@ -489,44 +556,46 @@ async function renderOneMessage(box, m, key, cid) {
   const time = document.createElement("span"); time.className = "time"; time.textContent = fmtTime(m.timestamp); el.appendChild(time);
   const actions = document.createElement("div"); actions.className = "msg-actions";
   [["i-reply", "Responder"], ["i-smile-plus", "Reagir"], ["i-forward", "Encaminhar"], ["i-more", "Mais"]].forEach(([icon, label]) => { const b = document.createElement("button"); b.type = "button"; b.title = label; b.setAttribute("aria-label", label); b.innerHTML = `<svg><use href="#${icon}"/></svg>`; b.onclick = () => messageAction(icon === "i-reply" ? "reply" : icon === "i-smile-plus" ? "react" : icon === "i-forward" ? "forward" : "more", m, cid); actions.appendChild(b); }); el.appendChild(actions);
-  let press; el.addEventListener("pointerdown", () => { press = setTimeout(() => messageAction("more", m, cid), 550); }); ["pointerup","pointerleave","pointercancel"].forEach(ev => el.addEventListener(ev, () => clearTimeout(press)));
+  let press;
+  el.addEventListener("pointerdown", () => { press = setTimeout(() => openMessageActions(el), 520); });
+  ["pointerup","pointerleave","pointercancel"].forEach(ev => el.addEventListener(ev, () => clearTimeout(press)));
+  el.addEventListener("contextmenu", e => { e.preventDefault(); openMessageActions(el); });
   box.appendChild(el); box.scrollTop = box.scrollHeight;
 }
 function openLightbox(src) { const b = $("#lightbox"); $("#lightbox-image").src = src; b.hidden = false; }
 $("#lightbox-close").onclick = () => $("#lightbox").hidden = true;
 $("#lightbox").onclick = e => { if (e.target.id === "lightbox") e.currentTarget.hidden = true; };
+function openMessageActions(el) {
+  document.querySelectorAll(".msg.context-open").forEach(x => x.classList.remove("context-open"));
+  el.classList.add("context-open");
+}
+document.addEventListener("click", e => { if (!e.target.closest(".msg")) document.querySelectorAll(".msg.context-open").forEach(x => x.classList.remove("context-open")); });
 async function messageAction(action, m, cid) {
   const key = await keyForChat(cid);
   const preview = m.type === "text" ? await decrypt({ iv:m.iv, data:m.encrypted }, key) : (m.fileName || "mídia");
-  if (action === "reply") {
-    state.replyTo = { id: m.id, preview };
-    $("#msg-input").placeholder = "Respondendo: " + preview;
-    $("#msg-input").focus();
-    return;
-  }
-  if (action === "react") {
-    const emoji = prompt("Escolha um emoji para reagir", "❤️");
-    if (emoji?.trim()) await toggleReaction(cid, m, emoji.trim());
-    return;
-  }
-  if (action === "forward") {
-    const target = prompt("Cole o ID da conversa de destino");
-    if (!target || !state.chats[target]) return;
-    const targetKey = await keyForChat(target);
-    const plain = m.type === "text" ? preview : await decrypt({ iv:m.iv, data:m.encrypted }, key);
-    const enc = await encrypt(plain, targetKey);
-    await push(ref(db, `messages/${target}`), {
-      senderId: state.user.uid, type: m.type, encrypted: enc.data, iv: enc.iv,
-      fileName: m.fileName || "", forwarded: true, timestamp: Date.now()
-    });
-    return;
-  }
-  if (action === "more") {
-    const choice = prompt("Digite uma opção: excluir para mim | excluir para todos | cancelar", "cancelar");
-    if (choice === "excluir para mim") return deleteMessage(cid, m, false);
-    if (choice === "excluir para todos" && m.senderId === state.user.uid) return deleteMessage(cid, m, true);
-  }
+  if (action === "reply") { state.replyTo = { id: m.id, preview }; $("#msg-input").placeholder = "Respondendo: " + preview; $("#msg-input").focus(); return; }
+  if (action === "react") return reactionMenu(cid, m);
+  if (action === "forward") return forwardMenu(cid, m, key, preview);
+  if (action === "more") return messageMenu(cid, m);
 }
+function reactionMenu(cid, m) {
+  const choices = ["❤️","👍","😂","😮","😢","🙏","🔥","🎉"];
+  const bg = modal({ title: "Reagir à mensagem", bodyHtml: `<div class="reaction-grid">${choices.map(e => `<button class="reaction-choice" data-emoji="${e}" type="button">${e}</button>`).join("")}</div>`, hideCancel:true, okText:"Fechar", onOk:()=>true });
+  bg.querySelectorAll("[data-emoji]").forEach(b => b.onclick = async () => { await toggleReaction(cid, m, b.dataset.emoji); bg.remove(); });
+}
+function forwardMenu(cid, m, key, preview) {
+  const entries = Object.entries(state.chats).filter(([id]) => id !== cid).slice(0, 12);
+  const html = entries.length ? entries.map(([id, chat]) => `<button class="menu-row" data-forward="${id}" type="button"><svg><use href="#i-forward"/></svg><span>${chat.type === "direct" ? directTitle(chat) : chat.name}</span></button>`).join("") : `<p class="dim">Crie outra conversa para encaminhar.</p>`;
+  const bg = modal({ title: "Encaminhar mensagem", bodyHtml: html, hideCancel:true, okText:"Fechar", onOk:()=>true });
+  bg.querySelectorAll("[data-forward]").forEach(b => b.onclick = async () => { const target=b.dataset.forward; const targetKey=await keyForChat(target); const plain=m.type === "text" ? preview : await decrypt({iv:m.iv,data:m.encrypted},key); const enc=await encrypt(plain,targetKey); await push(ref(db,`messages/${target}`),{senderId:state.user.uid,type:m.type,encrypted:enc.data,iv:enc.iv,fileName:m.fileName||"",forwarded:true,timestamp:Date.now()}); bg.remove(); toast("Mensagem encaminhada","success"); });
+}
+function messageMenu(cid, m) {
+  let html = `<button class="menu-row danger-row" data-menu="mine" type="button"><svg><use href="#i-trash"/></svg><span>Apagar para mim</span></button>`;
+  if (m.senderId === state.user.uid) html += `<button class="menu-row danger-row" data-menu="all" type="button"><svg><use href="#i-trash"/></svg><span>Apagar para todos</span></button>`;
+  const bg = modal({ title:"Ações da mensagem", bodyHtml:html, hideCancel:true, okText:"Fechar", onOk:()=>true });
+  bg.querySelectorAll("[data-menu]").forEach(b => b.onclick = async () => { await deleteMessage(cid,m,b.dataset.menu === "all"); bg.remove(); });
+}
+
 async function toggleReaction(cid, m, emoji) {
   const path = `messages/${cid}/${m.id}/reactions/${emoji}/${state.user.uid}`;
   const snap = await get(ref(db, path));
@@ -592,7 +661,7 @@ async function recordVoice() {
     };
     btn.onclick = stop;
   } catch (e) {
-    alert("Erro ao gravar: " + e.message);
+    toast("Erro ao gravar: " + e.message, "error");
     btn.classList.remove("recording");
   }
 }
@@ -604,7 +673,7 @@ function wireAttach() {
     const file = e.target.files[0];
     e.target.value = "";
     if (!file || !state.activeChat) return;
-    if (file.size > 900 * 1024) return alert("Arquivo muito grande. Máx 900 KB.");
+    if (file.size > 900 * 1024) return toast("Arquivo muito grande. Máximo de 900 KB.", "error");
     const dataUrl = await fileToDataUrl(file, 1000, 0.75);
     let type = "file";
     if (file.type.startsWith("image/")) type = "image";
@@ -694,7 +763,7 @@ function newContactModal() {
           bg.querySelector("#c-ghostid").value.trim().toUpperCase(),
           bg.querySelector("#c-alias").value.trim()
         );
-      } catch (e) { alert(e.message); return false; }
+      } catch (e) { toast(e.message, "error"); return false; }
     }
   });
 }
@@ -761,7 +830,7 @@ function inviteModal() {
     bodyHtml: field("Código", "i-code"),
     onOk: async (bg) => {
       try { await joinByInviteCode(bg.querySelector("#i-code").value.trim().toUpperCase()); }
-      catch (e) { alert(e.message); return false; }
+      catch (e) { toast(e.message, "error"); return false; }
     }
   });
 }
@@ -778,13 +847,13 @@ async function triggerCall(video) {
   const chat = state.chats[cid];
   if (!chat) return;
   const otherUid = Object.keys(chat.members || {}).find(u => u !== state.user.uid);
-  if (!otherUid) return alert("Não há outros participantes neste chat.");
-  if (chat.type !== "direct") alert("Chamada de grupo iniciada. Os participantes podem entrar pelo convite da chamada.");
+  if (!otherUid) return toast("Não há outros participantes neste chat.", "error");
+  if (chat.type !== "direct") toast("Chamada de grupo iniciada para os participantes.", "success");
   try {
     await startCall(otherUid, video);
     showCallUI(otherUid, video);
   } catch (e) {
-    alert("Erro ao iniciar: " + e.message);
+    toast("Erro ao iniciar: " + e.message, "error");
   }
 }
 
@@ -800,6 +869,8 @@ async function openConvMenu() {
     if (isAdmin && chat.type === "group") html += `<button class="primary" data-act="members">Gerenciar membros</button>`;
     html += `<button class="primary" data-act="leave">Sair</button>`;
   }
+  if (chat.type === "direct") html += `<button class="primary" data-act="profile"><svg><use href="#i-user"/></svg> Ver perfil</button>`;
+  html += `<button class="primary danger-action" data-act="delete-chat"><svg><use href="#i-trash"/></svg> Apagar conversa inteira</button>`;
   html += `<button class="primary" data-act="close">Fechar</button>`;
 
   const bg = modal({ title: chat.name || "Opções", bodyHtml: html, hideCancel: true, okText: "OK", onOk: () => true });
@@ -808,12 +879,14 @@ async function openConvMenu() {
     if (!b) return;
     const act = b.dataset.act;
     if (act === "close") { bg.remove(); return; }
+    if (act === "profile") { bg.remove(); const other = Object.keys(chat.members || {}).find(u => u !== state.user.uid); if (other) openUserProfile(other); return; }
+    if (act === "delete-chat") { bg.remove(); deleteConversation(cid); return; }
     if (act === "invite") {
       const code = await createInvite(cid);
       bg.remove();
       const link = `${location.origin}${location.pathname}?invite=${code}`;
       await navigator.clipboard.writeText(link).catch(()=>{});
-      alert("Copiado:\n" + link);
+      toast("Convite copiado", "success");
     }
     if (act === "leave") { await leaveChat(cid, state.user.uid); bg.remove(); }
     if (act === "addmem") { bg.remove(); addMembersModal(cid, chat); }
@@ -856,9 +929,22 @@ function manageMembersModal(cid, chat) {
   bg.querySelector(".modal-body").addEventListener("click", async (e) => {
     const ban = e.target.closest("[data-ban]");
     const prom = e.target.closest("[data-prom]");
-    if (ban) { if (confirm("Banir este membro?")) { await banMember(cid, ban.dataset.ban); bg.remove(); } }
+    if (ban) { confirmModal("Banir membro", "Esse membro perderá acesso a esta conversa.", async () => { await banMember(cid, ban.dataset.ban); bg.remove(); }); }
     if (prom) { await promoteToAdmin(cid, prom.dataset.prom); bg.remove(); }
   });
+}
+
+async function openUserProfile(uid) {
+  const snap = await get(ref(db, `users/${uid}`)); if (!snap.exists()) return;
+  const p = snap.val(); const blocked = !!state.blocks[uid];
+  const isContact = !!state.contacts[uid];
+  const bg = modal({ title: "Perfil", bodyHtml: `<div class="profile-cover" style="background-image:url('${p.banner || ""}')"></div><div class="profile-hero"><img class="profile-avatar" src="${p.avatar || avatarFallback(p.nickname || p.username)}"><div><h3>${p.nickname || p.username}</h3><small>${p.ghostId}</small></div></div><p class="profile-bio">${p.bio || "Este usuário ainda não adicionou uma bio."}</p><div class="profile-status"><svg><use href="#i-lock"/></svg> Conversa protegida por criptografia</div><div class="profile-actions">${isContact ? `<button class="primary" data-profile="chat"><svg><use href="#i-send"/></svg> Abrir conversa</button>` : `<button class="primary" data-profile="request"><svg><use href="#i-user"/></svg> Solicitar conversa</button>`}<button class="primary ${blocked ? "" : "danger-action"}" data-profile="block"><svg><use href="#i-lock"/></svg> ${blocked ? "Desbloquear usuário" : "Bloquear usuário"}</button></div>`, hideCancel:true, okText:"Fechar", onOk:()=>true });
+  bg.querySelectorAll("[data-profile]").forEach(b => b.onclick = async () => { const act=b.dataset.profile; if(act === "chat"){bg.remove(); openDirectChat(uid);} if(act === "request"){ await requestContactByGhostId(p.ghostId); bg.remove(); } if(act === "block"){ if(blocked) await unblockUser(uid); else await blockUser(uid); bg.remove(); } });
+}
+function blockedUsersModal() {
+  const entries = Object.keys(state.blocks || {}); const html = entries.length ? entries.map(uid => `<div class="blocked-row"><span>${uid.slice(0,8)}…</span><button class="secondary" data-unblock="${uid}" type="button">Desbloquear</button></div>`).join("") : `<p class="dim">Nenhum usuário bloqueado.</p>`;
+  const bg = modal({title:"Usuários bloqueados", bodyHtml:html, hideCancel:true, okText:"Fechar", onOk:()=>true});
+  bg.querySelectorAll("[data-unblock]").forEach(b => b.onclick = async () => { await unblockUser(b.dataset.unblock); bg.remove(); });
 }
 
 /* ============ SETTINGS ============ */
@@ -870,8 +956,9 @@ function openSettings() {
     bodyHtml: `
       <button class="primary" data-act="profile">Editar perfil</button>
       <button class="primary" data-act="wall">Papel de parede</button>
-      <button class="primary" data-act="copy">Copiar meu GHOST-ID</button>
-      <button class="primary" data-act="logout">Sair</button>
+      <button class="primary" data-act="copy"><svg><use href="#i-user"/></svg> Copiar meu GHOST-ID</button>
+      <button class="primary" data-act="blocked"><svg><use href="#i-lock"/></svg> Usuários bloqueados</button>
+      <button class="primary danger-action" data-act="logout"><svg><use href="#i-log-out"/></svg> Sair</button>
     `
   }).querySelector(".modal-body").addEventListener("click", async (e) => {
     const b = e.target.closest("button[data-act]");
@@ -880,7 +967,8 @@ function openSettings() {
     document.querySelector(".modal-bg")?.remove();
     if (act === "profile") editProfileModal();
     if (act === "wall")    wallpaperModal();
-    if (act === "copy")    { await navigator.clipboard.writeText(state.profile.ghostId); alert("Copiado: " + state.profile.ghostId); }
+    if (act === "copy")    { await navigator.clipboard.writeText(state.profile.ghostId); toast("GHOST-ID copiado", "success"); }
+    if (act === "blocked") { blockedUsersModal(); }
     if (act === "logout")  { await signOut(auth); location.reload(); }
   });
 }
@@ -979,7 +1067,7 @@ function wireCalls() {
     try {
       await acceptCall(c.id, c.video);
       showCallUI(c.from, c.video);
-    } catch (e) { alert("Erro: " + e.message); }
+    } catch (e) { toast("Erro: " + e.message, "error"); }
   };
   $("#incoming-reject").onclick = async () => {
     const c = state.incomingCall;
@@ -1036,8 +1124,8 @@ function showIncomingToast(call) {
   const wait = setInterval(async () => {
     if (!state.user) return;
     clearInterval(wait);
-    try { await joinByInviteCode(code.toUpperCase()); alert("Você entrou!"); }
-    catch (e) { alert("Convite inválido: " + e.message); }
+    try { await joinByInviteCode(code.toUpperCase()); toast("Você entrou na conversa", "success"); }
+    catch (e) { toast("Convite inválido: " + e.message, "error"); }
     history.replaceState(null, "", location.pathname);
   }, 500);
 })();

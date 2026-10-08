@@ -13,6 +13,8 @@ export const state = {
   privateKey: null,
   publicJwk: null,
   contacts: {},
+  contactRequests: {},
+  blocks: {},
   chats: {},
   communities: {},
   activeChat: null,
