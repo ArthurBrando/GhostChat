@@ -25,6 +25,13 @@ import {
 const $  = (s) => document.querySelector(s);
 const $$ = (s) => document.querySelectorAll(s);
 
+function withTimeout(promise, ms = 9000) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(() => reject(Object.assign(new Error("Tempo limite de conexão com o Firebase."), { code: "timeout" })), ms))
+  ]);
+}
+
 /* ============ SCREENS ============ */
 function show(name) {
   $$(".screen").forEach(s => s.classList.remove("active"));
@@ -32,6 +39,7 @@ function show(name) {
 }
 
 /* ============ LOGIN ============ */
+let creatingAccount = false;
 let pendingGhostId = generateGhostId();
 $("#login-ghostid").textContent = pendingGhostId;
 $("#btn-regen").onclick = () => {
@@ -46,22 +54,11 @@ $("#btn-login").onclick = async () => {
   if (username.length < 2) return err.textContent = "Nome muito curto.";
   if (!/^[a-zA-Z0-9_.-]+$/.test(username)) return err.textContent = "Use apenas letras, números, _ . -";
 
-  try {
-    const idSnap = await get(ref(db, `ghostIds/${pendingGhostId}`));
-    if (idSnap.exists()) {
-      pendingGhostId = generateGhostId();
-      $("#login-ghostid").textContent = pendingGhostId;
-      return err.textContent = "ID em uso, tente novamente.";
-    }
-  } catch (e) {
-    console.warn("Firebase indisponível antes do login", e);
-    return err.textContent = "Não foi possível conectar agora. Use a demonstração ou tente novamente.";
-  }
-
   show("loading");
   $("#loading-msg").textContent = "Criando identidade…";
 
   try {
+    creatingAccount = true;
     const { publicJwk, privateJwk } = await generateKeyPair();
     LS.set("privJwk", privateJwk);
     LS.set("pubJwk",  publicJwk);
@@ -69,6 +66,11 @@ $("#btn-login").onclick = async () => {
 
     const cred = await signInAnonymously(auth);
     const uid = cred.user.uid;
+    const idSnap = await withTimeout(get(ref(db, `ghostIds/${pendingGhostId}`)));
+    if (idSnap.exists()) {
+      pendingGhostId = generateGhostId();
+      $("#login-ghostid").textContent = pendingGhostId;
+    }
 
     await set(ref(db, `users/${uid}`), {
       ghostId: pendingGhostId,
@@ -79,33 +81,17 @@ $("#btn-login").onclick = async () => {
       lastSeen: Date.now(),
     });
     await set(ref(db, `ghostIds/${pendingGhostId}`), uid);
+    creatingAccount = false;
+    location.reload();
   } catch (e) {
+    creatingAccount = false;
     console.error(e);
     show("login");
-    err.textContent = "Erro: " + e.message;
+    const code = e?.code || "";
+    err.textContent = code.includes("operation-not-allowed") ? "A autenticação anônima está desativada no Firebase. Ative o provedor Anonymous no console do projeto." : code.includes("permission-denied") ? "O Firebase recusou o acesso ao banco. Revise as regras do Realtime Database." : "Não foi possível criar sua conta agora. Tente novamente.";
   }
 
 };
-
-// A polished offline/demo path keeps the product usable while Firebase is unavailable.
-$("#btn-demo").onclick = enterDemoMode;
-async function enterDemoMode() {
-  state.demo = true;
-  state.user = { uid: "demo-user" };
-  const pair = await generateKeyPair();
-  state.privateKey = await importPrivate(pair.privateJwk);
-  state.publicJwk = pair.publicJwk;
-  state.profile = { nickname: "Você", username: "voce", ghostId: "GHOST-DEMO-2026", avatar: "", bio: "" };
-  state.settings = LS.get("settings", { wallpaper: "" });
-  const other = { uid: "demo-ana", alias: "Ana Costa", profile: { nickname: "Ana Costa", username: "ana", ghostId: "GHOST-ANA-2026", avatar: avatarFallback("Ana") } };
-  state.contacts = { [other.uid]: other };
-  const cid = "d_demo-user_demo-ana";
-  state.chats = { [cid]: { type: "direct", members: { "demo-user": true, "demo-ana": true }, createdAt: Date.now() - 86400000 } };
-  const groupId = "g_demo-equipe";
-  state.chats[groupId] = { type: "group", name: "Equipe Ghost", avatar: "", members: { "demo-user": true, "demo-ana": true }, admins: { "demo-user": true }, owner: "demo-user", createdAt: Date.now() - 3600000 };
-  renderMe(); wireTabs(); wireNewMenu(); wireSettings(); wireEmoji(); wireComposer(); wireBack(); wireAttach(); wireCalls(); wireConvHeader();
-  show("app"); renderList();
-}
 
 /* ============ BOOT ============ */
 onAuthStateChanged(auth, async (user) => {
@@ -115,8 +101,16 @@ onAuthStateChanged(auth, async (user) => {
   show("loading");
   $("#loading-msg").textContent = "Carregando perfil…";
 
-  const snap = await get(ref(db, `users/${user.uid}`));
-  if (!snap.exists()) { await signOut(auth); return; }
+  let snap;
+  try {
+    snap = await withTimeout(get(ref(db, `users/${user.uid}`)));
+  } catch (e) {
+    console.error("Falha ao carregar perfil", e);
+    show("login");
+    $("#login-error").textContent = e.code === "timeout" ? "O Firebase não respondeu. Confira a conexão e tente novamente." : "Não foi possível carregar seu perfil.";
+    return;
+  }
+  if (!snap.exists()) { if (creatingAccount) return; await signOut(auth); return; }
   state.profile = snap.val();
 
   const privJwk = LS.get("privJwk");
@@ -165,7 +159,8 @@ async function bootApp() {
 
   subscribeContacts();
   subscribeChats();
-  if (!state.demo) { subscribeCommunities(state.user.uid, () => renderList()); listenIncomingCalls(state.user.uid, showIncomingToast); }
+  subscribeCommunities(state.user.uid, () => renderList());
+  listenIncomingCalls(state.user.uid, showIncomingToast);
 }
 
 function wireTabs() {
@@ -176,6 +171,7 @@ function wireTabs() {
     renderList();
   });
   state.currentTab = "chats";
+  $("#chat-search")?.addEventListener("input", renderList);
   renderList();
 }
 
@@ -189,7 +185,6 @@ function wireBack() {
 
 /* ============ CONTATOS ============ */
 function subscribeContacts() {
-  if (state.demo) return;
   const uid = state.user.uid;
   onValue(ref(db, `contacts/${uid}`), async (snap) => {
     const raw = snap.val() || {};
@@ -215,7 +210,6 @@ async function addContactByGhostId(ghostId, alias) {
 function directChatId(a, b) { return "d_" + [a, b].sort().join("_"); }
 
 function subscribeChats() {
-  if (state.demo) return;
   const uid = state.user.uid;
   onValue(ref(db, "chats"), (snap) => {
     const all = snap.val() || {};
@@ -292,6 +286,7 @@ async function createInvite(chatId) {
 function renderList() {
   const el = $("#list");
   el.innerHTML = "";
+  const term = ($("#chat-search")?.value || "").trim().toLowerCase();
   const tab = state.currentTab || "chats";
 
   if (tab === "contacts") {
@@ -323,9 +318,10 @@ function renderList() {
     return;
   }
 
-  const list = Object.entries(state.chats).filter(([, c]) =>
-    c.type === "direct" || (!c.communityId && (c.type === "group" || c.type === "channel"))
-  );
+  const list = Object.entries(state.chats).filter(([cid, c]) => {
+    const title = c.type === "direct" ? directTitle(c) : c.name;
+    return (c.type === "direct" || (!c.communityId && (c.type === "group" || c.type === "channel"))) && (!term || `${title} ${cid}`.toLowerCase().includes(term));
+  });
   list.sort((a, b) => (b[1].createdAt || 0) - (a[1].createdAt || 0));
   if (!list.length) return el.innerHTML = emptyMsg("Vazio. Toque em +.");
   for (const [cid, chat] of list) {
@@ -440,7 +436,6 @@ async function openCommunity(cid) {
 /* ============ CHAVE POR CHAT ============ */
 async function keyForChat(cid) {
   const chat = state.chats[cid];
-  if (state.demo) return deriveGroupKey(cid);
   if (!chat) return null;
   if (chat.type === "direct") {
     const otherUid = Object.keys(chat.members).find(u => u !== state.user.uid);
@@ -462,11 +457,6 @@ async function renderMessages(cid) {
   if (unsubMessages) unsubMessages();
 
   const key = await keyForChat(cid);
-  if (state.demo) {
-    const local = LS.get("demoMessages", {});
-    for (const m of (local[cid] || [])) await renderOneMessage(box, m, key, cid);
-    return;
-  }
   const q = query(ref(db, `messages/${cid}`), limitToLast(200));
   unsubMessages = onChildAdded(q, async (snap) => {
     const m = snap.val();
@@ -480,8 +470,8 @@ async function renderOneMessage(box, m, key, cid) {
   const mine = m.senderId === state.user.uid;
   el.className = "msg " + (mine ? "out" : "in") + (m.deleted ? " deleted" : "");
   el.dataset.messageId = m.id || "";
-  const senderSnap = state.demo ? null : await get(ref(db, `users/${m.senderId}/nickname`));
-  const senderName = state.demo ? (mine ? "Você" : "Ana Costa") : (senderSnap?.exists() ? senderSnap.val() : "???");
+  const senderSnap = await get(ref(db, `users/${m.senderId}/nickname`));
+  const senderName = senderSnap.exists() ? senderSnap.val() : "???";
   const meta = document.createElement("span"); meta.className = "meta"; meta.textContent = mine ? "" : senderName; el.appendChild(meta);
   if (m.replyPreview) { const q = document.createElement("div"); q.className = "msg-reply"; q.textContent = "↪ " + m.replyPreview; el.appendChild(q); }
   const body = document.createElement("span"); body.className = "body";
@@ -492,13 +482,13 @@ async function renderOneMessage(box, m, key, cid) {
     if (m.type === "image") { const img = document.createElement("img"); img.className = "image-preview"; img.src = dataUrl; img.alt = m.fileName || "Imagem enviada"; img.onclick = () => openLightbox(dataUrl); body.appendChild(img); }
     else if (m.type === "audio") { const au = document.createElement("audio"); au.controls = true; au.src = dataUrl; body.appendChild(au); }
     else if (m.type === "video") { const v = document.createElement("video"); v.controls = true; v.src = dataUrl; body.appendChild(v); }
-    else { const a = document.createElement("a"); a.className = "file-link"; a.href = dataUrl; a.download = m.fileName || "arquivo"; a.textContent = "Baixar " + (m.fileName || "arquivo"); body.appendChild(a); }
+    else { const a = document.createElement("a"); a.className = "file-link"; a.href = dataUrl; a.download = m.fileName || "arquivo"; a.innerHTML = `<svg><use href="#i-download"/></svg><span>Baixar ${m.fileName || "arquivo"}</span>`; body.appendChild(a); }
   }
   el.appendChild(body);
   if (m.reactions) { const r = document.createElement("div"); r.className = "msg-reactions"; Object.entries(m.reactions).forEach(([emoji, users]) => { const b = document.createElement("button"); b.className = "msg-reaction"; b.textContent = `${emoji} ${Object.keys(users || {}).length}`; b.onclick = () => toggleReaction(cid, m, emoji); r.appendChild(b); }); el.appendChild(r); }
   const time = document.createElement("span"); time.className = "time"; time.textContent = fmtTime(m.timestamp); el.appendChild(time);
   const actions = document.createElement("div"); actions.className = "msg-actions";
-  [["↩", "reply"], ["😀", "react"], ["↗", "forward"], ["⋯", "more"]].forEach(([label, act]) => { const b = document.createElement("button"); b.type = "button"; b.textContent = label; b.title = act; b.onclick = () => messageAction(act, m, cid); actions.appendChild(b); }); el.appendChild(actions);
+  [["i-reply", "Responder"], ["i-smile-plus", "Reagir"], ["i-forward", "Encaminhar"], ["i-more", "Mais"]].forEach(([icon, label]) => { const b = document.createElement("button"); b.type = "button"; b.title = label; b.setAttribute("aria-label", label); b.innerHTML = `<svg><use href="#${icon}"/></svg>`; b.onclick = () => messageAction(icon === "i-reply" ? "reply" : icon === "i-smile-plus" ? "react" : icon === "i-forward" ? "forward" : "more", m, cid); actions.appendChild(b); }); el.appendChild(actions);
   let press; el.addEventListener("pointerdown", () => { press = setTimeout(() => messageAction("more", m, cid), 550); }); ["pointerup","pointerleave","pointercancel"].forEach(ev => el.addEventListener(ev, () => clearTimeout(press)));
   box.appendChild(el); box.scrollTop = box.scrollHeight;
 }
@@ -506,20 +496,47 @@ function openLightbox(src) { const b = $("#lightbox"); $("#lightbox-image").src 
 $("#lightbox-close").onclick = () => $("#lightbox").hidden = true;
 $("#lightbox").onclick = e => { if (e.target.id === "lightbox") e.currentTarget.hidden = true; };
 async function messageAction(action, m, cid) {
-  const preview = m.type === "text" ? await decrypt({iv:m.iv,data:m.encrypted}, await keyForChat(cid)) : (m.fileName || "mídia");
-  if (action === "reply") { state.replyTo = { id: m.id, preview }; $("#msg-input").placeholder = "Respondendo: " + preview; $("#msg-input").focus(); return; }
-  if (action === "react") { const emoji = prompt("Emoji para reagir", "❤️"); if (emoji) toggleReaction(cid, m, emoji.trim()); return; }
-  if (action === "forward") { const target = prompt("ID do chat para encaminhar"); if (target && state.chats[target]) { const all = state.demo ? LS.get("demoMessages", {}) : null; if (state.demo) { (all[target] ||= []).push({...m, id: randomId(8), senderId: state.user.uid, forwarded: true, timestamp: Date.now()}); LS.set("demoMessages", all); alert("Mensagem encaminhada."); } } return; }
-  if (action === "more") { const choice = prompt("Digite: excluir para mim, excluir para todos ou cancelar", "cancelar"); if (choice === "excluir para mim") return deleteMessage(cid, m, false); if (choice === "excluir para todos" && m.senderId === state.user.uid) return deleteMessage(cid, m, true); }
+  const key = await keyForChat(cid);
+  const preview = m.type === "text" ? await decrypt({ iv:m.iv, data:m.encrypted }, key) : (m.fileName || "mídia");
+  if (action === "reply") {
+    state.replyTo = { id: m.id, preview };
+    $("#msg-input").placeholder = "Respondendo: " + preview;
+    $("#msg-input").focus();
+    return;
+  }
+  if (action === "react") {
+    const emoji = prompt("Escolha um emoji para reagir", "❤️");
+    if (emoji?.trim()) await toggleReaction(cid, m, emoji.trim());
+    return;
+  }
+  if (action === "forward") {
+    const target = prompt("Cole o ID da conversa de destino");
+    if (!target || !state.chats[target]) return;
+    const targetKey = await keyForChat(target);
+    const plain = m.type === "text" ? preview : await decrypt({ iv:m.iv, data:m.encrypted }, key);
+    const enc = await encrypt(plain, targetKey);
+    await push(ref(db, `messages/${target}`), {
+      senderId: state.user.uid, type: m.type, encrypted: enc.data, iv: enc.iv,
+      fileName: m.fileName || "", forwarded: true, timestamp: Date.now()
+    });
+    return;
+  }
+  if (action === "more") {
+    const choice = prompt("Digite uma opção: excluir para mim | excluir para todos | cancelar", "cancelar");
+    if (choice === "excluir para mim") return deleteMessage(cid, m, false);
+    if (choice === "excluir para todos" && m.senderId === state.user.uid) return deleteMessage(cid, m, true);
+  }
 }
 async function toggleReaction(cid, m, emoji) {
   const path = `messages/${cid}/${m.id}/reactions/${emoji}/${state.user.uid}`;
-  if (state.demo) { const all=LS.get("demoMessages",{}); const item=(all[cid]||[]).find(x=>x.id===m.id); if(item){ item.reactions ||= {}; item.reactions[emoji] ||= {}; item.reactions[emoji][state.user.uid] = item.reactions[emoji][state.user.uid] ? null : true; if(!item.reactions[emoji][state.user.uid]) delete item.reactions[emoji][state.user.uid]; LS.set("demoMessages",all); return renderMessages(cid); } }
-  const snap = await get(ref(db,path)); await set(ref(db,path), snap.exists() ? null : true); renderMessages(cid);
+  const snap = await get(ref(db, path));
+  await set(ref(db, path), snap.exists() ? null : true);
+  renderMessages(cid);
 }
 async function deleteMessage(cid, m, everyone) {
-  if (state.demo) { const all=LS.get("demoMessages",{}); const list=all[cid]||[]; const i=list.findIndex(x=>x.id===m.id); if(i>=0){ if(everyone) list[i].deleted=true; else list.splice(i,1); LS.set("demoMessages",all); renderMessages(cid); } return; }
-  if (everyone) await update(ref(db, `messages/${cid}/${m.id}`), { deleted:true, encrypted:"", iv:"" }); else LS.set("hiddenMessages", {...LS.get("hiddenMessages",{}), [m.id]:true}); renderMessages(cid);
+  if (everyone) await update(ref(db, `messages/${cid}/${m.id}`), { deleted: true, encrypted: "", iv: "" });
+  else LS.set("hiddenMessages", { ...LS.get("hiddenMessages", {}), [m.id]: true });
+  renderMessages(cid);
 }
 
 function fmtTime(ts) {
@@ -549,7 +566,6 @@ async function sendText() {
     ...(state.replyTo ? { replyTo: state.replyTo.id, replyPreview: state.replyTo.preview } : {})
   };
   state.replyTo = null;
-  if (state.demo) { const all = LS.get("demoMessages", {}); (all[cid] ||= []).push({ id: randomId(8), ...message }); LS.set("demoMessages", all); return renderMessages(cid); }
   await push(ref(db, `messages/${cid}`), message);
 }
 
@@ -558,7 +574,6 @@ async function sendMedia(cid, type, dataUrl, extra = {}) {
   const enc = await encrypt(dataUrl, key);
   const mediaMessage = { senderId: state.user.uid, type, encrypted: enc.data, iv: enc.iv, timestamp: Date.now(), ...extra, ...(state.replyTo ? { replyTo: state.replyTo.id, replyPreview: state.replyTo.preview } : {}) };
   state.replyTo = null;
-  if (state.demo) { const all = LS.get("demoMessages", {}); (all[cid] ||= []).push({ id: randomId(8), ...mediaMessage }); LS.set("demoMessages", all); return renderMessages(cid); }
   await push(ref(db, `messages/${cid}`), mediaMessage);
 }
 

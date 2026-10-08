@@ -22,7 +22,6 @@ export const state = {
   incomingCall: null,
   activeCall: null,
   currentTab: "chats",
-  demo: false,
   replyTo: null,
 };
 
