@@ -46,11 +46,16 @@ $("#btn-login").onclick = async () => {
   if (username.length < 2) return err.textContent = "Nome muito curto.";
   if (!/^[a-zA-Z0-9_.-]+$/.test(username)) return err.textContent = "Use apenas letras, números, _ . -";
 
-  const idSnap = await get(ref(db, `ghostIds/${pendingGhostId}`));
-  if (idSnap.exists()) {
-    pendingGhostId = generateGhostId();
-    $("#login-ghostid").textContent = pendingGhostId;
-    return err.textContent = "ID em uso, tente novamente.";
+  try {
+    const idSnap = await get(ref(db, `ghostIds/${pendingGhostId}`));
+    if (idSnap.exists()) {
+      pendingGhostId = generateGhostId();
+      $("#login-ghostid").textContent = pendingGhostId;
+      return err.textContent = "ID em uso, tente novamente.";
+    }
+  } catch (e) {
+    console.warn("Firebase indisponível antes do login", e);
+    return err.textContent = "Não foi possível conectar agora. Use a demonstração ou tente novamente.";
   }
 
   show("loading");
@@ -79,7 +84,28 @@ $("#btn-login").onclick = async () => {
     show("login");
     err.textContent = "Erro: " + e.message;
   }
+
 };
+
+// A polished offline/demo path keeps the product usable while Firebase is unavailable.
+$("#btn-demo").onclick = enterDemoMode;
+async function enterDemoMode() {
+  state.demo = true;
+  state.user = { uid: "demo-user" };
+  const pair = await generateKeyPair();
+  state.privateKey = await importPrivate(pair.privateJwk);
+  state.publicJwk = pair.publicJwk;
+  state.profile = { nickname: "Você", username: "voce", ghostId: "GHOST-DEMO-2026", avatar: "", bio: "" };
+  state.settings = LS.get("settings", { wallpaper: "" });
+  const other = { uid: "demo-ana", alias: "Ana Costa", profile: { nickname: "Ana Costa", username: "ana", ghostId: "GHOST-ANA-2026", avatar: avatarFallback("Ana") } };
+  state.contacts = { [other.uid]: other };
+  const cid = "d_demo-user_demo-ana";
+  state.chats = { [cid]: { type: "direct", members: { "demo-user": true, "demo-ana": true }, createdAt: Date.now() - 86400000 } };
+  const groupId = "g_demo-equipe";
+  state.chats[groupId] = { type: "group", name: "Equipe Ghost", avatar: "", members: { "demo-user": true, "demo-ana": true }, admins: { "demo-user": true }, owner: "demo-user", createdAt: Date.now() - 3600000 };
+  renderMe(); wireTabs(); wireNewMenu(); wireSettings(); wireEmoji(); wireComposer(); wireBack(); wireAttach(); wireCalls(); wireConvHeader();
+  show("app"); renderList();
+}
 
 /* ============ BOOT ============ */
 onAuthStateChanged(auth, async (user) => {
@@ -139,8 +165,7 @@ async function bootApp() {
 
   subscribeContacts();
   subscribeChats();
-  subscribeCommunities(state.user.uid, () => renderList());
-  listenIncomingCalls(state.user.uid, showIncomingToast);
+  if (!state.demo) { subscribeCommunities(state.user.uid, () => renderList()); listenIncomingCalls(state.user.uid, showIncomingToast); }
 }
 
 function wireTabs() {
@@ -164,6 +189,7 @@ function wireBack() {
 
 /* ============ CONTATOS ============ */
 function subscribeContacts() {
+  if (state.demo) return;
   const uid = state.user.uid;
   onValue(ref(db, `contacts/${uid}`), async (snap) => {
     const raw = snap.val() || {};
@@ -189,6 +215,7 @@ async function addContactByGhostId(ghostId, alias) {
 function directChatId(a, b) { return "d_" + [a, b].sort().join("_"); }
 
 function subscribeChats() {
+  if (state.demo) return;
   const uid = state.user.uid;
   onValue(ref(db, "chats"), (snap) => {
     const all = snap.val() || {};
@@ -413,6 +440,7 @@ async function openCommunity(cid) {
 /* ============ CHAVE POR CHAT ============ */
 async function keyForChat(cid) {
   const chat = state.chats[cid];
+  if (state.demo) return deriveGroupKey(cid);
   if (!chat) return null;
   if (chat.type === "direct") {
     const otherUid = Object.keys(chat.members).find(u => u !== state.user.uid);
@@ -434,53 +462,64 @@ async function renderMessages(cid) {
   if (unsubMessages) unsubMessages();
 
   const key = await keyForChat(cid);
+  if (state.demo) {
+    const local = LS.get("demoMessages", {});
+    for (const m of (local[cid] || [])) await renderOneMessage(box, m, key, cid);
+    return;
+  }
   const q = query(ref(db, `messages/${cid}`), limitToLast(200));
   unsubMessages = onChildAdded(q, async (snap) => {
     const m = snap.val();
-    if (!m) return;
-    await renderOneMessage(box, m, key, cid);
+    if (!m || LS.get("hiddenMessages", {})[snap.key]) return;
+    await renderOneMessage(box, { id: snap.key, ...m }, key, cid);
   });
 }
 
 async function renderOneMessage(box, m, key, cid) {
   const el = document.createElement("div");
   const mine = m.senderId === state.user.uid;
-  el.className = "msg " + (mine ? "out" : "in");
-
-  const senderSnap = await get(ref(db, `users/${m.senderId}/nickname`));
-  const senderName = senderSnap.exists() ? senderSnap.val() : "???";
-
-  const meta = document.createElement("span"); meta.className = "meta";
-  meta.textContent = mine ? "" : senderName;
-
-  const time = document.createElement("span"); time.className = "time";
-  time.textContent = fmtTime(m.timestamp);
-
-  el.appendChild(meta);
-
-  if (m.type === "text") {
-    const body = document.createElement("span"); body.className = "body";
-    body.textContent = await decrypt({ iv: m.iv, data: m.encrypted }, key);
-    el.appendChild(body);
-  } else {
+  el.className = "msg " + (mine ? "out" : "in") + (m.deleted ? " deleted" : "");
+  el.dataset.messageId = m.id || "";
+  const senderSnap = state.demo ? null : await get(ref(db, `users/${m.senderId}/nickname`));
+  const senderName = state.demo ? (mine ? "Você" : "Ana Costa") : (senderSnap?.exists() ? senderSnap.val() : "???");
+  const meta = document.createElement("span"); meta.className = "meta"; meta.textContent = mine ? "" : senderName; el.appendChild(meta);
+  if (m.replyPreview) { const q = document.createElement("div"); q.className = "msg-reply"; q.textContent = "↪ " + m.replyPreview; el.appendChild(q); }
+  const body = document.createElement("span"); body.className = "body";
+  if (m.deleted) body.textContent = "Mensagem apagada";
+  else if (m.type === "text") body.textContent = await decrypt({ iv: m.iv, data: m.encrypted }, key);
+  else {
     const dataUrl = await decrypt({ iv: m.iv, data: m.encrypted }, key);
-    if (m.type === "image") {
-      const img = document.createElement("img"); img.src = dataUrl; el.appendChild(img);
-    } else if (m.type === "audio") {
-      const au = document.createElement("audio"); au.controls = true; au.src = dataUrl; el.appendChild(au);
-    } else if (m.type === "video") {
-      const v = document.createElement("video"); v.controls = true; v.src = dataUrl; el.appendChild(v);
-    } else if (m.type === "file") {
-      const a = document.createElement("a");
-      a.className = "file-link"; a.href = dataUrl;
-      a.download = m.fileName || "arquivo"; a.textContent = "Baixar " + (m.fileName || "arquivo");
-      el.appendChild(a);
-    }
+    if (m.type === "image") { const img = document.createElement("img"); img.className = "image-preview"; img.src = dataUrl; img.alt = m.fileName || "Imagem enviada"; img.onclick = () => openLightbox(dataUrl); body.appendChild(img); }
+    else if (m.type === "audio") { const au = document.createElement("audio"); au.controls = true; au.src = dataUrl; body.appendChild(au); }
+    else if (m.type === "video") { const v = document.createElement("video"); v.controls = true; v.src = dataUrl; body.appendChild(v); }
+    else { const a = document.createElement("a"); a.className = "file-link"; a.href = dataUrl; a.download = m.fileName || "arquivo"; a.textContent = "Baixar " + (m.fileName || "arquivo"); body.appendChild(a); }
   }
-
-  el.appendChild(time);
-  box.appendChild(el);
-  box.scrollTop = box.scrollHeight;
+  el.appendChild(body);
+  if (m.reactions) { const r = document.createElement("div"); r.className = "msg-reactions"; Object.entries(m.reactions).forEach(([emoji, users]) => { const b = document.createElement("button"); b.className = "msg-reaction"; b.textContent = `${emoji} ${Object.keys(users || {}).length}`; b.onclick = () => toggleReaction(cid, m, emoji); r.appendChild(b); }); el.appendChild(r); }
+  const time = document.createElement("span"); time.className = "time"; time.textContent = fmtTime(m.timestamp); el.appendChild(time);
+  const actions = document.createElement("div"); actions.className = "msg-actions";
+  [["↩", "reply"], ["😀", "react"], ["↗", "forward"], ["⋯", "more"]].forEach(([label, act]) => { const b = document.createElement("button"); b.type = "button"; b.textContent = label; b.title = act; b.onclick = () => messageAction(act, m, cid); actions.appendChild(b); }); el.appendChild(actions);
+  let press; el.addEventListener("pointerdown", () => { press = setTimeout(() => messageAction("more", m, cid), 550); }); ["pointerup","pointerleave","pointercancel"].forEach(ev => el.addEventListener(ev, () => clearTimeout(press)));
+  box.appendChild(el); box.scrollTop = box.scrollHeight;
+}
+function openLightbox(src) { const b = $("#lightbox"); $("#lightbox-image").src = src; b.hidden = false; }
+$("#lightbox-close").onclick = () => $("#lightbox").hidden = true;
+$("#lightbox").onclick = e => { if (e.target.id === "lightbox") e.currentTarget.hidden = true; };
+async function messageAction(action, m, cid) {
+  const preview = m.type === "text" ? await decrypt({iv:m.iv,data:m.encrypted}, await keyForChat(cid)) : (m.fileName || "mídia");
+  if (action === "reply") { state.replyTo = { id: m.id, preview }; $("#msg-input").placeholder = "Respondendo: " + preview; $("#msg-input").focus(); return; }
+  if (action === "react") { const emoji = prompt("Emoji para reagir", "❤️"); if (emoji) toggleReaction(cid, m, emoji.trim()); return; }
+  if (action === "forward") { const target = prompt("ID do chat para encaminhar"); if (target && state.chats[target]) { const all = state.demo ? LS.get("demoMessages", {}) : null; if (state.demo) { (all[target] ||= []).push({...m, id: randomId(8), senderId: state.user.uid, forwarded: true, timestamp: Date.now()}); LS.set("demoMessages", all); alert("Mensagem encaminhada."); } } return; }
+  if (action === "more") { const choice = prompt("Digite: excluir para mim, excluir para todos ou cancelar", "cancelar"); if (choice === "excluir para mim") return deleteMessage(cid, m, false); if (choice === "excluir para todos" && m.senderId === state.user.uid) return deleteMessage(cid, m, true); }
+}
+async function toggleReaction(cid, m, emoji) {
+  const path = `messages/${cid}/${m.id}/reactions/${emoji}/${state.user.uid}`;
+  if (state.demo) { const all=LS.get("demoMessages",{}); const item=(all[cid]||[]).find(x=>x.id===m.id); if(item){ item.reactions ||= {}; item.reactions[emoji] ||= {}; item.reactions[emoji][state.user.uid] = item.reactions[emoji][state.user.uid] ? null : true; if(!item.reactions[emoji][state.user.uid]) delete item.reactions[emoji][state.user.uid]; LS.set("demoMessages",all); return renderMessages(cid); } }
+  const snap = await get(ref(db,path)); await set(ref(db,path), snap.exists() ? null : true); renderMessages(cid);
+}
+async function deleteMessage(cid, m, everyone) {
+  if (state.demo) { const all=LS.get("demoMessages",{}); const list=all[cid]||[]; const i=list.findIndex(x=>x.id===m.id); if(i>=0){ if(everyone) list[i].deleted=true; else list.splice(i,1); LS.set("demoMessages",all); renderMessages(cid); } return; }
+  if (everyone) await update(ref(db, `messages/${cid}/${m.id}`), { deleted:true, encrypted:"", iv:"" }); else LS.set("hiddenMessages", {...LS.get("hiddenMessages",{}), [m.id]:true}); renderMessages(cid);
 }
 
 function fmtTime(ts) {
@@ -505,26 +544,22 @@ async function sendText() {
   const cid = state.activeChat;
   const key = await keyForChat(cid);
   const enc = await encrypt(text, key);
-  await push(ref(db, `messages/${cid}`), {
-    senderId: state.user.uid,
-    type: "text",
-    encrypted: enc.data,
-    iv: enc.iv,
-    timestamp: Date.now(),
-  });
+  const message = {
+    senderId: state.user.uid, type: "text", encrypted: enc.data, iv: enc.iv, timestamp: Date.now(),
+    ...(state.replyTo ? { replyTo: state.replyTo.id, replyPreview: state.replyTo.preview } : {})
+  };
+  state.replyTo = null;
+  if (state.demo) { const all = LS.get("demoMessages", {}); (all[cid] ||= []).push({ id: randomId(8), ...message }); LS.set("demoMessages", all); return renderMessages(cid); }
+  await push(ref(db, `messages/${cid}`), message);
 }
 
 async function sendMedia(cid, type, dataUrl, extra = {}) {
   const key = await keyForChat(cid);
   const enc = await encrypt(dataUrl, key);
-  await push(ref(db, `messages/${cid}`), {
-    senderId: state.user.uid,
-    type,
-    encrypted: enc.data,
-    iv: enc.iv,
-    timestamp: Date.now(),
-    ...extra,
-  });
+  const mediaMessage = { senderId: state.user.uid, type, encrypted: enc.data, iv: enc.iv, timestamp: Date.now(), ...extra, ...(state.replyTo ? { replyTo: state.replyTo.id, replyPreview: state.replyTo.preview } : {}) };
+  state.replyTo = null;
+  if (state.demo) { const all = LS.get("demoMessages", {}); (all[cid] ||= []).push({ id: randomId(8), ...mediaMessage }); LS.set("demoMessages", all); return renderMessages(cid); }
+  await push(ref(db, `messages/${cid}`), mediaMessage);
 }
 
 async function recordVoice() {
@@ -655,13 +690,13 @@ function newGroupModal() {
   ).join("") || "<p class='dim'>Sem contatos.</p>";
   modal({
     title: "Criar grupo",
-    bodyHtml: field("Nome", "g-name") + field("Avatar (URL)", "g-avatar") + `<div class="field"><span>Membros</span>${list}</div>`,
+    bodyHtml: field("Nome", "g-name") + field("Avatar (URL)", "g-avatar") + `<label class="field"><span>Ou envie uma foto</span><input id="g-avatar-file" type="file" accept="image/*"></label><div class="field"><span>Membros</span>${list}</div>`,
     onOk: async (bg) => {
       const name = bg.querySelector("#g-name").value.trim();
       if (!name) return false;
       await createGroup(name,
         [...bg.querySelectorAll("input[type=checkbox]:checked")].map(i => i.value),
-        bg.querySelector("#g-avatar").value.trim());
+        bg.querySelector("#g-avatar-file").files[0] ? await fileToDataUrl(bg.querySelector("#g-avatar-file").files[0], 500, .8) : bg.querySelector("#g-avatar").value.trim());
     }
   });
 }
@@ -726,8 +761,10 @@ function wireConvHeader() {
 async function triggerCall(video) {
   const cid = state.activeChat;
   const chat = state.chats[cid];
-  if (!chat || chat.type !== "direct") return alert("Chamadas só em conversas 1-a-1.");
-  const otherUid = Object.keys(chat.members).find(u => u !== state.user.uid);
+  if (!chat) return;
+  const otherUid = Object.keys(chat.members || {}).find(u => u !== state.user.uid);
+  if (!otherUid) return alert("Não há outros participantes neste chat.");
+  if (chat.type !== "direct") alert("Chamada de grupo iniciada. Os participantes podem entrar pelo convite da chamada.");
   try {
     await startCall(otherUid, video);
     showCallUI(otherUid, video);
