@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Ghost Chat — Anônimo e Criptografado</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+  <!-- TELA DE CARREGAMENTO -->
+  <div id="screen-loading" class="screen active">
+    <div class="logo">👻</div>
+    <h1>Ghost Chat</h1>
+    <p class="sub">Conectando anonimamente...</p>
+    <div class="spinner"></div>
+  </div>
+
+  <!-- TELA DE SETUP -->
+  <div id="screen-setup" class="screen">
+    <div class="logo">👻</div>
+    <h1>Criar Identidade</h1>
+    <p class="sub">Escolha um apelido e uma senha de criptografia.<br>
+      <small>Guarde a senha! Sem ela ninguém lê suas mensagens — nem você.</small>
+    </p>
+
+    <div id="virtual-id-box">
+      <span class="label">Seu número virtual</span>
+      <span id="virtual-id">GH-000-0000</span>
+      <button id="btn-regen-id" title="Gerar outro">🔄</button>
+    </div>
+
+    <input id="input-nickname" type="text" placeholder="Apelido (ex: Fantasma)" maxlength="20" />
+    <input id="input-passphrase" type="password" placeholder="Senha de criptografia" minlength="6" />
+    <button id="btn-enter" class="primary">Entrar no Ghost Chat</button>
+    <p id="setup-error" class="error"></p>
+  </div>
+
+  <!-- TELA DO CHAT -->
+  <div id="screen-chat" class="screen">
+    <header id="chat-header">
+      <div class="avatar">👻</div>
+      <div class="info">
+        <strong>Lobby Global</strong>
+        <small id="header-id">GH-000-0000</small>
+      </div>
+      <button id="btn-logout" title="Sair">⎋</button>
+    </header>
+
+    <main id="messages"></main>
+
+    <footer id="input-area">
+      <input id="message-input" type="text" placeholder="Mensagem criptografada..." maxlength="2000" />
+      <button id="send-button" title="Enviar">➤</button>
+    </footer>
+  </div>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>
