@@ -4,7 +4,7 @@ export function fileToDataUrl(file, maxSize = 900, quality = 0.75) {
   return new Promise((res, rej) => {
     const r = new FileReader();
     r.onload = () => {
-      if (!file.type.startsWith("image/")) return res(r.result); // áudio/arquivo cru
+      if (!file.type.startsWith("image/")) return res(r.result);
       const img = new Image();
       img.onload = () => {
         const canvas = document.createElement("canvas");
@@ -23,7 +23,6 @@ export function fileToDataUrl(file, maxSize = 900, quality = 0.75) {
 }
 
 export function dataUrlBytes(dataUrl) {
-  // estimativa do tamanho em bytes
   const i = dataUrl.indexOf(",");
   const b64 = dataUrl.slice(i + 1);
   return Math.floor(b64.length * 0.75);
