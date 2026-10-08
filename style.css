@@ -515,7 +515,6 @@ button.primary:active{transform:translateY(0) scale(.98)}
   box-shadow:0 0 0 3px rgba(255,255,255,0.04);
 }
 
-/* mic toggle */
 #btn-mic .ic-stop{display:none}
 #btn-mic.recording{color:var(--danger);background:rgba(239,68,68,0.12);animation:pulseRec 1.2s ease-in-out infinite}
 #btn-mic.recording .ic-mic{display:none}
@@ -693,7 +692,6 @@ button.primary:active{transform:translateY(0) scale(.98)}
 .round.ok{background:linear-gradient(135deg,#10b981,#059669);box-shadow:0 4px 20px rgba(16,185,129,0.4)}
 .round.ok:hover{box-shadow:0 8px 28px rgba(16,185,129,0.6)}
 
-/* mic/cam toggle */
 #call-mic .off,#call-cam .off{opacity:0;pointer-events:none}
 #call-mic.muted .on,#call-cam.off-state .on{opacity:0}
 #call-mic.muted .off,#call-cam.off-state .off{opacity:1}
